@@ -1,10 +1,13 @@
 """港区集装箱过闸记录查询网页（Flask + SQLite）。
 
 并发与一致性设计：
-- 一次查询 = 一个读事务：批次指针、布隆过滤器、原件行来自同一已提交快照。
-- 更正 = 整份替换：一个写事务内版本 +1、删旧行、写新行、作废旧过滤器。
+- 一次查询 = 一个读事务：批次指针、布隆过滤器、明细行来自同一已提交快照。
+- 更正 = 增量写入：文件仍整体校验、批次照常升版；归一化后同一行号上
+  箱号与 UTC 时刻都相同的明细行直接复用，SQLite 只写新增/改动/删去的行；
+  未改动的行保留其最初写入时的版号，但查询一律按批次当前版号呈现。
 - 过滤器后台构建：构建期间同批照常更正/查询；提交时仅当批次仍停留在
   构建时的版本才启用（条件更新），迟到的旧索引直接丢弃，不覆盖新版。
+- 更正成功即作废旧过滤器；写入失败整体回滚，原版明细与原索引照常可查。
 - 构建失败只标记状态，查询自动回退为逐行扫描原件。
 """
 from __future__ import annotations
@@ -72,7 +75,12 @@ def index():
 
 @app.post("/batches")
 def upload_batch():
-    """按批号上传 CSV；同批号即更正，整份替换。"""
+    """按批号上传 CSV；同批号即更正：整份校验、批次升版、明细增量写入。
+
+    归一化后同一行号上箱号与 UTC 时刻都相同的行原样复用（不产生任何写入）；
+    只有新增、改动、删去的明细行走 SQLite 写入。整个过程在一个写事务内，
+    任一步失败即回滚，旧版明细与旧过滤器保持可用。
+    """
     batch_id = (request.form.get("batch") or "").strip()
     if not BATCH_RE.fullmatch(batch_id):
         flash(f"批号非法（允许字母/数字/_/-，1~64 字符）: {batch_id!r}", "error")
@@ -86,57 +94,112 @@ def upload_batch():
         flash(f"批次 {batch_id} 上传被拒绝：文件超过 {MAX_UPLOAD_BYTES} 字节", "error")
         return redirect(url_for("index"))
     try:
-        rows = parse_csv(data)  # 先整体校验，再落库
+        rows = parse_csv(data)  # 先整体校验（规则不变），通过后才动库
     except CsvError as e:
         flash(f"批次 {batch_id} 上传被拒绝：{e}", "error")
         return redirect(url_for("index"))
 
     db = get_db()
     try:
-        db.execute("BEGIN IMMEDIATE")
-        db.execute(
-            """
-            INSERT INTO batches (id, version, row_count, uploaded_at,
-                                 filter_version, filter_status, building_version, filter_error)
-            VALUES (?, 1, ?, ?, NULL, 'none', NULL, NULL)
-            ON CONFLICT(id) DO UPDATE SET
-                version          = batches.version + 1,
-                row_count        = excluded.row_count,
-                uploaded_at      = excluded.uploaded_at,
-                filter_version   = NULL,
-                filter_status    = 'none',
-                building_version = NULL,
-                filter_error     = NULL
-            """,
-            (batch_id, len(rows), utcnow()),
-        )
-        version = db.execute(
-            "SELECT version FROM batches WHERE id = ?", (batch_id,)
-        ).fetchone()["version"]
-        db.execute("DELETE FROM rows WHERE batch_id = ?", (batch_id,))
-        db.executemany(
-            "INSERT INTO rows (batch_id, batch_version, line_no, container, gate_time_utc)"
-            " VALUES (?, ?, ?, ?, ?)",
-            [(batch_id, version, i, c, t) for i, (c, t) in enumerate(rows, start=1)],
-        )
-        # 旧版本过滤器一律清除（若有正在进行的旧构建，其提交会被条件更新拒绝）
-        db.execute(
-            "DELETE FROM filters WHERE batch_id = ? AND version <> ?", (batch_id, version)
-        )
-        db.execute("COMMIT")
+        version, reused, inserted, updated, deleted = apply_csv_correction(db, batch_id, rows)
     except Exception:
-        db.execute("ROLLBACK")
+        if db.in_transaction:
+            db.execute("ROLLBACK")
         raise
-    flash(
-        f"批次 {batch_id} 已上传：v{version}，{len(rows)} 行（整份替换，旧过滤器已失效）",
-        "ok",
-    )
+    if version == 1:
+        flash(
+            f"批次 {batch_id} 已上传：v1，{len(rows)} 行"
+            f"（新增 {inserted} 行，复用 {reused} 行）",
+            "ok",
+        )
+    else:
+        flash(
+            f"批次 {batch_id} 更正完成：升版至 v{version}，{len(rows)} 行；"
+            f"明细复用 {reused} 行，仅写入新增 {inserted} / 改动 {updated} / 删除 {deleted} 行，"
+            f"旧过滤器已失效",
+            "ok",
+        )
     return redirect(url_for("index"))
+
+
+def apply_csv_correction(db, batch_id: str, rows: list[tuple[str, str]]) -> tuple[int, int, int, int, int]:
+    """在单个写事务内完成增量更正，返回 (新版号, 复用, 新增, 改动, 删除行数)。"""
+    db.execute("BEGIN IMMEDIATE")
+    # 1) 批次照常升版（新批号插 v1；老批号 version+1 并作废旧过滤器指针）
+    db.execute(
+        """
+        INSERT INTO batches (id, version, row_count, uploaded_at,
+                             filter_version, filter_status, building_version, filter_error)
+        VALUES (?, 1, ?, ?, NULL, 'none', NULL, NULL)
+        ON CONFLICT(id) DO UPDATE SET
+            version          = batches.version + 1,
+            row_count        = excluded.row_count,
+            uploaded_at      = excluded.uploaded_at,
+            filter_version   = NULL,
+            filter_status    = 'none',
+            building_version = NULL,
+            filter_error     = NULL
+        """,
+        (batch_id, len(rows), utcnow()),
+    )
+    version = db.execute(
+        "SELECT version FROM batches WHERE id = ?", (batch_id,)
+    ).fetchone()["version"]
+
+    # 2) 取现有明细（含每行最后写入时的版号），按行号做三向 diff
+    old = {
+        r["line_no"]: (r["container"], r["gate_time_utc"])
+        for r in db.execute(
+            "SELECT line_no, container, gate_time_utc FROM rows WHERE batch_id = ?",
+            (batch_id,),
+        )
+    }
+    new = dict(enumerate(rows, start=1))
+    reused = inserted = updated = deleted = 0
+    to_insert: list[tuple] = []
+    to_update: list[tuple] = []
+    for line_no, (container, gate_time) in new.items():
+        if line_no not in old:
+            to_insert.append((batch_id, line_no, version, container, gate_time))
+            inserted += 1
+        elif old[line_no] != (container, gate_time):
+            to_update.append((container, gate_time, version, batch_id, line_no))
+            updated += 1
+        else:
+            reused += 1  # 行号+箱号+UTC 时刻一致 → 整行复用，不产生写入
+    to_delete = sorted(set(old) - set(new))
+    deleted = len(to_delete)
+
+    # 3) SQLite 只对新增、改动、删去的明细行执行写入
+    if to_delete:
+        db.executemany(
+            "DELETE FROM rows WHERE batch_id = ? AND line_no = ?",
+            [(batch_id, ln) for ln in to_delete],
+        )
+    if to_update:
+        db.executemany(
+            "UPDATE rows SET container = ?, gate_time_utc = ?, batch_version = ?"
+            " WHERE batch_id = ? AND line_no = ?",
+            to_update,
+        )
+    if to_insert:
+        db.executemany(
+            "INSERT INTO rows (batch_id, line_no, batch_version, container, gate_time_utc)"
+            " VALUES (?, ?, ?, ?, ?)",
+            to_insert,
+        )
+
+    # 4) 旧版本过滤器一律清除（若有正在进行的旧构建，其提交会被条件更新拒绝）
+    db.execute(
+        "DELETE FROM filters WHERE batch_id = ? AND version <> ?", (batch_id, version)
+    )
+    db.execute("COMMIT")
+    return version, reused, inserted, updated, deleted
 
 
 @app.post("/batches/<batch_id>/filter")
 def build_filter(batch_id: str):
-    """为当前版本原件后台构建布隆过滤器（≤2 KiB）。
+    """为当前版本明细后台构建布隆过滤器（≤2 KiB）。
 
     表单字段 delay 为测试钩子：构建前人为延迟秒数，用于演练
     “建索引与更正交错”的场景，上限 MAX_BUILD_DELAY。
@@ -216,7 +279,7 @@ def api_batches():
 def run_query(db, container: str) -> dict:
     """按箱号查询：列出命中行与实际扫描过的批次。
 
-    整个查询在一个读事务内完成 —— 批次版本、过滤器、原件行均来自
+    整个查询在一个读事务内完成 —— 批次版本、过滤器、明细行均来自
     同一已提交快照；期间发生的更正/建索引对本查询不可见。
     """
     db.execute("BEGIN")
@@ -238,15 +301,17 @@ def run_query(db, container: str) -> dict:
                 if frow is not None:
                     bf = BloomFilter(frow["m_bits"], frow["k_hashes"], bytes(frow["blob"]))
             if bf is not None and container not in bf:
-                # 同版过滤器判定不存在 → 跳过原件
+                # 同版过滤器判定不存在 → 跳过该批明细
                 skipped.append(entry)
                 continue
-            # 无同版过滤器（未建/构建中/已失败）或过滤器不能排除 → 逐行核对原件
+            # 无同版过滤器（未建/构建中/已失败）或过滤器不能排除 → 逐行核对明细。
+            # rows 只保留当前版批次的明细（未改行的行内版号可能较旧），因此这里
+            # 按 batch_id 取行；呈现给用户的版号统一用快照内的批次当前版号。
             hits = db.execute(
                 "SELECT line_no, gate_time_utc FROM rows"
-                " WHERE batch_id = ? AND batch_version = ? AND container = ?"
+                " WHERE batch_id = ? AND container = ?"
                 " ORDER BY line_no",
-                (bid, ver, container),
+                (bid, container),
             ).fetchall()
             entry["rows_scanned"] = b["row_count"]
             scanned.append(entry)
@@ -280,21 +345,21 @@ def _build_worker(db_path: str, batch_id: str, version: int, delay: float) -> No
             time.sleep(delay)  # 测试钩子：模拟慢构建
         conn = connect(db_path)
         try:
-            # 1) 同一已提交快照内读出该版本全部箱号
+            # 1) 同一已提交快照内读出该批次当前全部箱号（rows 只保留现版明细）
             conn.execute("BEGIN")
             try:
                 containers = [
                     r["container"]
                     for r in conn.execute(
                         "SELECT container FROM rows"
-                        " WHERE batch_id = ? AND batch_version = ? ORDER BY line_no",
-                        (batch_id, version),
+                        " WHERE batch_id = ? ORDER BY line_no",
+                        (batch_id,),
                     )
                 ]
             finally:
                 conn.execute("COMMIT")
             if not containers:
-                raise RuntimeError("该版本没有可索引的行（可能已被更正替换）")
+                raise RuntimeError("该批次没有可索引的行（可能已被更正替换）")
             # 2) 纯内存构建，不占用数据库
             bf = BloomFilter.build(containers)
             if bf.nbytes > MAX_FILTER_BYTES:

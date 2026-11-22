@@ -32,7 +32,7 @@
 </form>
 </fieldset>
 
-<fieldset><legend>上传 / 更正批次（同批号即整份替换；CSV 两列：箱号,UTC过闸时刻，≤ {{ max_rows }} 行）</legend>
+<fieldset><legend>上传 / 更正批次（同批号再传即更正：文件按原规则校验、批次照常升版，未改动的明细行自动复用，仅写增/改/删的行；CSV 两列：箱号,UTC过闸时刻，≤ {{ max_rows }} 行）</legend>
 <form method="post" action="{{ url_for('upload_batch') }}" enctype="multipart/form-data">
   批号 <input name="batch" required pattern="[A-Za-z0-9_\-]{1,64}" placeholder="如 LOT-20261122-A">
   <input type="file" name="file" accept=".csv" required>
